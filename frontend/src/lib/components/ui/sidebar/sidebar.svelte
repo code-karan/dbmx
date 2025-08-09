@@ -15,6 +15,9 @@
 		children,
 		tabID = $bindable(0),
 		tabName = $bindable(''),
+		tabTableDBPoolID = $bindable(''),
+		tabPostgresConnID = $bindable(0),
+		tabDBName = $bindable(''),
 		...restProps
 	}: WithElementRef<HTMLAttributes<HTMLDivElement>> & {
 		side?: 'left' | 'right';
@@ -22,6 +25,9 @@
 		collapsible?: 'offcanvas' | 'icon' | 'none';
 		tabID?: number;
 		tabName?: string;
+		tabTableDBPoolID?: string;
+		tabPostgresConnID?: number;
+		tabDBName?: string;
 	} = $props();
 
 	const sidebar = useSidebar();

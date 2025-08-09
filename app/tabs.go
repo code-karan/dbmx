@@ -1,26 +1,105 @@
 package app
 
 import (
+	"context"
 	"database/sql"
 	"dbmx/model"
 	"encoding/json"
+
+	"github.com/google/uuid"
+	"github.com/pkg/errors"
 )
 
 type Tabs struct {
 	DB *sql.DB
+	PM *PoolManager
 }
 
-func NewTabs(db *sql.DB) *Tabs {
+func NewTabs(db *sql.DB, pm *PoolManager) *Tabs {
 	return &Tabs{
 		DB: db,
+		PM: pm,
 	}
 }
 
-func (t *Tabs) AddTab(activeDBID, activeDB, activeDBColour string) (*model.Tab, error) {
+func (t *Tabs) AddTab(activeDBID, activeDB, activeDBColour, tableName, tabType string, postgresConnID int64, dbName, postgresConnName string) (*model.Tab, error) {
 	var active_db_id, active_db, active_db_colour *string
+
+	// Required for tab type table
+	var postgres_conn_id *int64
+	var db_name *string
+
+	var tableColumnsString string
+	var tableColumns []string
+
+	name := "Editor"
+
+	if tabType == "table" {
+		if postgresConnID == 0 {
+			return nil, errors.New("postgres connection id is required for tab type table")
+		}
+		if dbName == "" {
+			return nil, errors.New("database name is required for tab type table")
+		}
+		if tableName == "" {
+			return nil, errors.New("table name is required for tab type table")
+		}
+		if activeDBID == "" {
+			return nil, errors.New("active db pool id is required for tab type table")
+		}
+
+		postgres_conn_id = &postgresConnID
+		db_name = &dbName
+		name = tableName
+
+		// Get the columns of the table
+
+		// Convert active db id to uuid
+		activePoolID, err := uuid.Parse(activeDBID)
+		if err != nil {
+			return nil, err
+		}
+		pool, exists := t.PM.GetPool(activePoolID)
+		if !exists {
+			return nil, errors.New("pool doesn't exist")
+		}
+
+		// Get all columns
+		query := `
+			SELECT column_name
+			FROM information_schema.columns
+			WHERE table_name = $1
+			  AND table_schema = 'public';
+		`
+		rows, err := pool.Query(context.Background(), query, tableName)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+
+		// Iterate through the rows
+		for rows.Next() {
+			var column string
+			err := rows.Scan(&column)
+			if err != nil {
+				return nil, err
+			}
+			tableColumns = append(tableColumns, column)
+		}
+
+		// marshal the table columns into json
+		tableColumnsJSON, err := json.Marshal(tableColumns)
+		if err != nil {
+			return nil, err
+		}
+
+		tableColumnsString = string(tableColumnsJSON)
+	}
+
 	if activeDBID != "" {
 		active_db_id = &activeDBID
 	}
+
 	if activeDB != "" {
 		active_db = &activeDB
 	}
@@ -28,9 +107,13 @@ func (t *Tabs) AddTab(activeDBID, activeDB, activeDBColour string) (*model.Tab, 
 		active_db_colour = &activeDBColour
 	}
 
+	if !model.IsValidTabType(tabType) {
+		return nil, errors.New("invalid tab type. Only editor and table are allowed.")
+	}
+
 	// Insert a new active tab
-	query := `INSERT INTO tabs (name, editor, output, is_active, active_db_id, active_db, active_db_colour) VALUES ('SQL Editor', '', '', true, ?, ?, ?);`
-	result, err := t.DB.Exec(query, active_db_id, active_db, active_db_colour)
+	query := `INSERT INTO tabs (name, editor, output, is_active, active_db_id, active_db, active_db_colour, type, postgres_conn_id, db_name, postgres_conn_name, "select", "limit", "offset", "where", "order_by", "group_by", table_columns) VALUES (?, '', '', true, ?, ?, ?, ?, ?, ?, ?, '', '', '', '', '', '', ?);`
+	result, err := t.DB.Exec(query, name, active_db_id, active_db, active_db_colour, tabType, postgres_conn_id, db_name, postgresConnName, tableColumnsString)
 	if err != nil {
 		return nil, err
 	}
@@ -47,14 +130,17 @@ func (t *Tabs) AddTab(activeDBID, activeDB, activeDBColour string) (*model.Tab, 
 	}
 
 	return &model.Tab{
-		ID:            insertedID,
-		Name:          "SQL Editor",
-		Editor:        "",
-		Output:        "",
-		IsActive:      true,
-		ActiveDBID:    active_db_id,
-		ActiveDB:      active_db,
-		ActiveDBColor: active_db_colour,
+		ID:               insertedID,
+		Name:             name,
+		IsActive:         true,
+		ActiveDBID:       active_db_id,
+		ActiveDB:         active_db,
+		ActiveDBColor:    active_db_colour,
+		Type:             tabType,
+		PostgresConnID:   postgres_conn_id,
+		DBName:           db_name,
+		PostgresConnName: postgresConnName,
+		TableColumnsList: tableColumns,
 	}, nil
 }
 
@@ -70,12 +156,19 @@ func (t *Tabs) SetActiveTab(id int64) (*model.Tab, error) {
 	updateQuery = `UPDATE tabs SET is_active = true WHERE id = ? RETURNING *`
 
 	var tab model.Tab
-	err = t.DB.QueryRow(updateQuery, id).Scan(&tab.ID, &tab.Name, &tab.Editor, &tab.Output, &tab.IsActive, &tab.ActiveDBID, &tab.ActiveDB, &tab.ActiveDBColor)
+	err = t.DB.QueryRow(updateQuery, id).Scan(&tab.ID, &tab.Name, &tab.Editor, &tab.Output, &tab.IsActive, &tab.ActiveDBID, &tab.ActiveDB, &tab.ActiveDBColor, &tab.Type, &tab.PostgresConnID, &tab.DBName, &tab.PostgresConnName, &tab.Select, &tab.Limit, &tab.Offset, &tab.Where, &tab.OrderBy, &tab.GroupBy, &tab.TableColumns)
 	if err != nil {
 		return nil, err
 	}
 
-	if tab.Output == "" {
+	if len(tab.TableColumns) > 0 {
+		err = json.Unmarshal([]byte(tab.TableColumns), &tab.TableColumnsList)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if len(tab.Output) == 0 {
 		return &tab, nil
 	}
 
@@ -93,7 +186,7 @@ func (t *Tabs) SetActiveTab(id int64) (*model.Tab, error) {
 
 func (t *Tabs) GetAllTabs() ([]model.Tab, error) {
 	// Query for all tabs
-	query := `SELECT id, name, editor, output, is_active, active_db_id, active_db, active_db_colour FROM tabs`
+	query := `SELECT id, name, editor, output, is_active, active_db_id, active_db, active_db_colour, type, postgres_conn_id, db_name, postgres_conn_name, "select", "limit", "offset", "where", "order_by", "group_by", table_columns FROM tabs`
 	rows, err := t.DB.Query(query)
 	if err != nil {
 		return nil, err
@@ -103,20 +196,29 @@ func (t *Tabs) GetAllTabs() ([]model.Tab, error) {
 	var tabs []model.Tab
 	for rows.Next() {
 		var tab model.Tab
-		err := rows.Scan(&tab.ID, &tab.Name, &tab.Editor, &tab.Output, &tab.IsActive, &tab.ActiveDBID, &tab.ActiveDB, &tab.ActiveDBColor)
+		err := rows.Scan(&tab.ID, &tab.Name, &tab.Editor, &tab.Output, &tab.IsActive, &tab.ActiveDBID, &tab.ActiveDB, &tab.ActiveDBColor, &tab.Type, &tab.PostgresConnID, &tab.DBName, &tab.PostgresConnName, &tab.Select, &tab.Limit, &tab.Offset, &tab.Where, &tab.OrderBy, &tab.GroupBy, &tab.TableColumns)
 		if err != nil {
 			return nil, err
 		}
 
 		if tab.IsActive {
-			var output model.Output
-			err = json.Unmarshal([]byte(tab.Output), &output)
-			if err != nil {
-				return nil, err
+			if len(tab.TableColumns) > 0 {
+				err = json.Unmarshal([]byte(tab.TableColumns), &tab.TableColumnsList)
+				if err != nil {
+					return nil, err
+				}
 			}
 
-			tab.Columns = output.Columns
-			tab.Rows = output.Rows
+			if len(tab.Output) > 0 {
+				var output model.Output
+				err = json.Unmarshal([]byte(tab.Output), &output)
+				if err != nil {
+					return nil, err
+				}
+
+				tab.Columns = output.Columns
+				tab.Rows = output.Rows
+			}
 		}
 
 		tabs = append(tabs, tab)
@@ -158,19 +260,28 @@ func (t *Tabs) DeleteTab(id int64) (*model.Tab, error) {
 			query = `UPDATE tabs SET is_active = true WHERE id = (SELECT id FROM tabs WHERE id != ? LIMIT 1) RETURNING *`
 			row := t.DB.QueryRow(query, id)
 
-			err = row.Scan(&tab.ID, &tab.Name, &tab.Editor, &tab.Output, &tab.IsActive, &tab.ActiveDBID, &tab.ActiveDB, &tab.ActiveDBColor)
+			err = row.Scan(&tab.ID, &tab.Name, &tab.Editor, &tab.Output, &tab.IsActive, &tab.ActiveDBID, &tab.ActiveDB, &tab.ActiveDBColor, &tab.Type, &tab.PostgresConnID, &tab.DBName, &tab.PostgresConnName, &tab.Select, &tab.Limit, &tab.Offset, &tab.Where, &tab.OrderBy, &tab.GroupBy, &tab.TableColumns)
 			if err != nil {
 				return nil, err
 			}
 
-			var output model.Output
-			err = json.Unmarshal([]byte(tab.Output), &output)
-			if err != nil {
-				return nil, err
+			if len(tab.TableColumns) > 0 {
+				err = json.Unmarshal([]byte(tab.TableColumns), &tab.TableColumnsList)
+				if err != nil {
+					return nil, err
+				}
 			}
 
-			tab.Columns = output.Columns
-			tab.Rows = output.Rows
+			if len(tab.Output) > 0 {
+				var output model.Output
+				err = json.Unmarshal([]byte(tab.Output), &output)
+				if err != nil {
+					return nil, err
+				}
+
+				tab.Columns = output.Columns
+				tab.Rows = output.Rows
+			}
 		} else {
 			isLastTab = true
 		}
@@ -190,9 +301,9 @@ func (t *Tabs) DeleteTab(id int64) (*model.Tab, error) {
 	return nil, nil
 }
 
-func (t *Tabs) UpdateTabEditorContent(id int64, editor string) error {
-	query := `UPDATE tabs SET editor = ? WHERE id = ?`
-	_, err := t.DB.Exec(query, editor, id)
+func (t *Tabs) UpdateTabEditorContent(id int64, editor string, selectQuery, limit, offset, where, orderBy, groupBy string) error {
+	query := `UPDATE tabs SET editor = ?, "select" = ?, "limit" = ?, "offset" = ?, "where" = ?, "order_by" = ?, "group_by" = ? WHERE id = ?`
+	_, err := t.DB.Exec(query, editor, selectQuery, limit, offset, where, orderBy, groupBy, id)
 	if err != nil {
 		return err
 	}
@@ -212,7 +323,9 @@ func (t *Tabs) SaveActiveDBProps(id int64, activeDBID, activeDB, activeDBColour 
 		active_db_colour = &activeDBColour
 	}
 
-	query := `UPDATE tabs SET active_db_id = ?, active_db = ?, active_db_colour = ? WHERE id = ?`
+	// NOTE: Only update for tab type editor
+	// Update the active db properties in the tab of type editor
+	query := `UPDATE tabs SET active_db_id = ?, active_db = ?, active_db_colour = ? WHERE id = ? AND type = 'editor'`
 	_, err := t.DB.Exec(query, active_db_id, active_db, active_db_colour, id)
 	if err != nil {
 		return err
