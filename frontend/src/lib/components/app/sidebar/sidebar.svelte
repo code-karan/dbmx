@@ -1,8 +1,3 @@
-<script lang="ts" module>
-	import { onDestroy, onMount } from 'svelte';
-	import type { model } from '$lib/wailsjs/go/models';
-</script>
-
 <script lang="ts">
 	import * as Collapsible from '$lib/components/ui/collapsible/index.js';
 	import * as Sidebar from '$lib/components/ui/sidebar/index.js';
@@ -20,8 +15,20 @@
 		ref = $bindable(null),
 		tabID = $bindable(0),
 		tabName = $bindable(''),
+		tabTableDBPoolID = $bindable(''),
+		tabPostgresConnID = $bindable(0),
+		tabDBName = $bindable(''),
+		onAddTab,
 		...restProps
-	}: ComponentProps<typeof Sidebar.Root> = $props();
+	}: ComponentProps<typeof Sidebar.Root> & {
+		onAddTab?: (
+			tableName?: string,
+			postgresConnID?: number,
+			dbName?: string,
+			tableDBPoolID?: string,
+			postgresConnName?: string
+		) => void;
+	} = $props();
 
 	import {
 		postgresConnectionsMap,
@@ -58,7 +65,7 @@
 			.catch((error) => {
 				// Handle errors from the EstablishPostgresDatabaseConnection call
 				toast.error('Connection Failed', {
-					description: error,
+					description: error.message,
 					action: {
 						label: 'OK',
 						onClick: () => console.info('OK')
@@ -89,14 +96,26 @@
 		dbLoadingMap.set(dbID, true);
 
 		// Establish connection
-		EstablishPostgresDatabaseConnection(id, dbID, db.Name)
+		EstablishPostgresDatabaseConnection(id, db.Name)
 			.then((db) => {
 				dbLoadingMap.set(dbID, false);
-				databasesMap.set(db.ID, db);
+				databasesMap.set(dbID, db);
 
 				$activeDBs.push(db);
-				$suggestions.push(...db.Tables);
-				$suggestions.push(...db.Columns);
+				// Add tables and columns to suggestions set
+
+				if (db.Tables) {
+					db.Tables.forEach((table) => $suggestions.add(table));
+				}
+				if (db.Columns) {
+					db.Columns.forEach((column) => $suggestions.add(column));
+				}
+
+				// If the server and database to which connection was established is the current table's database
+				// Set the tab table db pool id so that it's connected
+				if (tabPostgresConnID === db.PostgresConnectionID && tabDBName === db.Name) {
+					tabTableDBPoolID = db.PoolID;
+				}
 
 				$selectedDBDisplay = db.PostgresConnectionName + ' - ' + db.Name;
 				$currentColor = db.Colour;
@@ -109,7 +128,7 @@
 				dbLoadingMap.set(dbID, false);
 
 				toast.error('Connection Failed', {
-					description: error,
+					description: error.message,
 					action: {
 						label: 'OK',
 						onClick: () => console.info('OK')
@@ -133,8 +152,19 @@
 					databasesMap.set(db.ID, db);
 					if (db.IsActive) {
 						$activeDBs.push(db);
-						$suggestions.push(...db.Tables);
-						$suggestions.push(...db.Columns);
+						// Add tables and columns to suggestions set
+						if (db.Tables) {
+							db.Tables.forEach((table) => $suggestions.add(table));
+						}
+						if (db.Columns) {
+							db.Columns.forEach((column) => $suggestions.add(column));
+						}
+
+						// If the server and database to which connection was established is the current table's database
+						// Set the tab table db pool id so that it's connected
+						if (tabPostgresConnID === db.PostgresConnectionID && tabDBName === db.Name) {
+							tabTableDBPoolID = db.PoolID;
+						}
 
 						// Set active DB
 						$selectedDBDisplay = db.PostgresConnectionName + ' - ' + db.Name;
@@ -155,7 +185,7 @@
 				loadingMap.set(id, false);
 				// Handle errors from the EstablishPostgresDatabaseConnection call
 				toast.error('Connection Failed', {
-					description: error,
+					description: error.message,
 					action: {
 						label: 'OK',
 						onClick: () => console.info('OK')
@@ -209,26 +239,30 @@
 						$activeDBs.findIndex((db) => db.ID === dbID),
 						1
 					); // Use splice to remove the item
-					$suggestions.splice(
-						$suggestions.findIndex((table) => db.Tables.includes(table)),
-						db.Tables.length
-					);
-					$suggestions.splice(
-						$suggestions.findIndex((column) => db.Columns.includes(column)),
-						db.Columns.length
-					);
+					// Remove tables and columns from suggestions set
+					if (db.Tables) {
+						db.Tables.forEach((table) => $suggestions.delete(table));
+					}
+					if (db.Columns) {
+						db.Columns.forEach((column) => $suggestions.delete(column));
+					}
 					db.IsActive = false;
 					db.Tables = [];
 					db.Columns = [];
 					databasesMap.delete(dbID);
 					databasesMap.set(dbID, db);
 
+					// If the active tab is connected to this db, disconnect it
+					if (tabTableDBPoolID === db.PoolID) {
+						tabTableDBPoolID = '';
+					}
+
 					if ($activeDBs.length == 0) {
 						$selectedDBDisplay = 'Connect to a database';
 						$currentColor = '';
 						$activePoolID = '';
 					} else {
-						// Set active DB
+						// Set first db as active DB
 						$selectedDBDisplay = $activeDBs[0].PostgresConnectionName + ' - ' + $activeDBs[0].Name;
 						$currentColor = $activeDBs[0].Colour;
 						$activePoolID = $activeDBs[0].PoolID;
@@ -241,7 +275,7 @@
 			})
 			.catch((error) => {
 				toast.error('Failed to disconnect', {
-					description: error,
+					description: error.message,
 					action: {
 						label: 'OK',
 						onClick: () => console.info('OK')
@@ -269,7 +303,7 @@
 				dbLoadingMap.set(dbID, false);
 
 				toast.error('Failed to refresh', {
-					description: error,
+					description: error.message,
 					action: {
 						label: 'OK',
 						onClick: () => console.info('OK')
@@ -277,17 +311,44 @@
 				});
 			});
 	}
+
+	// Function to handle adding a new tab
+	function handleAddTab(
+		tableName?: string,
+		postgresConnID?: number,
+		dbName?: string,
+		tableDBPoolID?: string,
+		postgresConnName?: string
+	) {
+		if (onAddTab) {
+			onAddTab(tableName, postgresConnID, dbName, tableDBPoolID, postgresConnName);
+		}
+	}
 </script>
 
-<Sidebar.Root bind:ref {tabID} {tabName} {...restProps}>
+<Sidebar.Root
+	bind:ref
+	{tabID}
+	{tabName}
+	{tabTableDBPoolID}
+	{tabPostgresConnID}
+	{tabDBName}
+	{...restProps}
+	variant="floating"
+>
 	<Sidebar.Content>
 		<Sidebar.Group>
 			<Sidebar.GroupLabel>
 				<div class="flex w-full items-center justify-between">
 					Connections
-					<Button size="sm" variant="ghost" onclick={() => refresh()}>
-						<RefreshCw />
-					</Button>
+					<div class="flex gap-1">
+						<Button size="sm" variant="ghost" onclick={() => handleAddTab()}>
+							<Plus />
+						</Button>
+						<Button size="sm" variant="ghost" onclick={() => refresh()}>
+							<RefreshCw />
+						</Button>
+					</div>
 				</div>
 			</Sidebar.GroupLabel>
 			<Sidebar.GroupContent>
@@ -307,10 +368,10 @@
 								<Collapsible.Content>
 									<Sidebar.MenuSub>
 										{#if loadingMap.get(connection.ID)}
-											<Skeleton class="my-1 h-[20px] w-[100px] rounded-full" />
-											<Skeleton class="my-1 h-[20px] w-[100px] rounded-full" />
-											<Skeleton class="my-1 h-[20px] w-[100px] rounded-full" />
-											<Skeleton class="my-1 h-[20px] w-[100px] rounded-full" />
+											<Sidebar.MenuSkeleton />
+											<Sidebar.MenuSkeleton />
+											<Sidebar.MenuSkeleton />
+											<Sidebar.MenuSkeleton />
 										{:else if (connectionDatabasesMap.get(connection.ID) || []).length > 0}
 											{#each connectionDatabasesMap.get(connection.ID) || [] as databaseID}
 												<Collapsible.Root open={databasesMap.get(databaseID)?.IsActive}>
@@ -343,16 +404,44 @@
 													<Collapsible.Content>
 														<Sidebar.MenuSub>
 															{#if dbLoadingMap.get(databaseID)}
-																<Skeleton class="my-1 h-[20px] w-[100px] rounded-full" />
-																<Skeleton class="my-1 h-[20px] w-[100px] rounded-full" />
-																<Skeleton class="my-1 h-[20px] w-[100px] rounded-full" />
-																<Skeleton class="my-1 h-[20px] w-[100px] rounded-full" />
+																<Sidebar.MenuSkeleton />
+																<Sidebar.MenuSkeleton />
+																<Sidebar.MenuSkeleton />
+																<Sidebar.MenuSkeleton />
 															{:else if (databasesMap.get(databaseID)?.Tables || []).length > 0}
 																{#each databasesMap.get(databaseID)?.Tables || [] as table}
-																	<Sidebar.MenuButton>
-																		<Table2 color="#fd6868" strokeWidth={2} size={25} />
-																		<p>{table}</p>
-																	</Sidebar.MenuButton>
+																	<ContextMenu.Root>
+																		<ContextMenu.Trigger>
+																			<Sidebar.MenuButton
+																				ondblclick={() =>
+																					handleAddTab(
+																						table,
+																						connection.ID,
+																						databasesMap.get(databaseID)?.Name,
+																						databasesMap.get(databaseID)?.PoolID,
+																						connection.Name
+																					)}
+																			>
+																				<Table2 color="#fd6868" strokeWidth={2} size={25} />
+																				<p>{table}</p>
+																			</Sidebar.MenuButton>
+																		</ContextMenu.Trigger>
+																		<ContextMenu.Content>
+																			<ContextMenu.Item
+																				onclick={() =>
+																					handleAddTab(
+																						table,
+																						connection.ID,
+																						databasesMap.get(databaseID)?.Name,
+																						databasesMap.get(databaseID)?.PoolID,
+																						connection.Name
+																					)}
+																			>
+																				<Plus class="mr-2 h-4 w-4" />
+																				Open in New Tab
+																			</ContextMenu.Item>
+																		</ContextMenu.Content>
+																	</ContextMenu.Root>
 																{/each}
 															{:else}
 																No tables found

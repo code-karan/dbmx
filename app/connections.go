@@ -7,10 +7,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
+
 	"github.com/jackc/pgx/v5"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/pkg/errors"
@@ -21,10 +23,10 @@ type Connections struct {
 	PM *PoolManager
 }
 
-func NewConnections(db *sql.DB) *Connections {
+func NewConnections(db *sql.DB, pm *PoolManager) *Connections {
 	return &Connections{
 		DB: db,
-		PM: NewPoolManager(),
+		PM: pm,
 	}
 }
 
@@ -157,7 +159,10 @@ func (c *Connections) RefreshPostgresDatabase(id int64, dbID, dbName, poolID str
 	}, nil
 }
 
-func (c *Connections) EstablishPostgresDatabaseConnection(id int64, dbID, dbName string) (*model.Database, error) {
+// This func is used to connect a specific database within a server
+// id is the postgres connection id primary key in the sqlite3 database
+// dbID uniquely identifies the active database within a connection
+func (c *Connections) EstablishPostgresDatabaseConnection(id int64, dbName string) (*model.Database, error) {
 	// Query for a single row by ID
 	var name, host, port, username, password, colour string
 	row := c.DB.QueryRow("SELECT name, host, port, username, password, colour FROM postgres WHERE id = ?", id)
@@ -183,20 +188,35 @@ func (c *Connections) EstablishPostgresDatabaseConnection(id int64, dbID, dbName
 		return nil, err
 	}
 
-	// Get all tables
+	// Get all table names for suggestions
 	tables, err := c.GetAllPostgresTables(activePoolID)
 	if err != nil {
 		return nil, err
 	}
 
-	// Get all columns
+	// Get all columns of all tables for suggestions
 	columns, err := c.GetAllDatabaseColumns(activePoolID)
 	if err != nil {
 		return nil, err
 	}
 
+	activeDB := name + " - " + dbName
+
+	// Save the active db properties in all the tabs with type editor if active db properties are null
+	_, err = c.DB.Exec("UPDATE tabs SET active_db_id = ?, active_db = ?, active_db_colour = ? WHERE active_db_id IS NULL AND type = 'editor'", activePoolID.String(), activeDB, colour)
+	if err != nil {
+		return nil, err
+	}
+
+	// In case of table rows, find all the rows with type table where
+	// active_db_id is null and postgres_connection_id and database matches
+	// set the active pool id and active db properties in such tabs
+	_, err = c.DB.Exec("UPDATE tabs SET active_db_id = ?, active_db = ?, active_db_colour = ? WHERE active_db_id IS NULL AND type = 'table' AND postgres_conn_id = ? AND db_name = ?", activePoolID.String(), activeDB, colour, id, dbName)
+	if err != nil {
+		return nil, err
+	}
+
 	return &model.Database{
-		ID:                     dbID,
 		Name:                   dbName,
 		PostgresConnectionID:   id,
 		PostgresConnectionName: name,
@@ -208,6 +228,7 @@ func (c *Connections) EstablishPostgresDatabaseConnection(id int64, dbID, dbName
 	}, nil
 }
 
+// This func is used to connect to a server
 func (c *Connections) EstablishPostgresConnection(id int64) ([]model.Database, error) {
 	// Query for a single row by ID
 	var name, host, port, username, password, database, colour string
@@ -236,6 +257,22 @@ func (c *Connections) EstablishPostgresConnection(id int64) ([]model.Database, e
 
 	// Establish connection and add pool to active pool manager
 	_, err = c.PM.AddPool(activePoolID, connString)
+	if err != nil {
+		return nil, err
+	}
+
+	activeDB := name + " - " + database
+
+	// Save the active db properties in all the tabs with type editor if active db properties are null
+	_, err = c.DB.Exec("UPDATE tabs SET active_db_id = ?, active_db = ?, active_db_colour = ? WHERE active_db_id IS NULL AND type = 'editor'", activePoolID.String(), activeDB, colour)
+	if err != nil {
+		return nil, err
+	}
+
+	// In case of table rows, find all the rows with type table where
+	// active_db_id is null and postgres_connection_id and database matches
+	// set the active pool id and active db properties in such tabs
+	_, err = c.DB.Exec("UPDATE tabs SET active_db_id = ?, active_db = ?, active_db_colour = ? WHERE active_db_id IS NULL AND type = 'table' AND postgres_conn_id = ? AND db_name = ?", activePoolID.String(), activeDB, colour, id, database)
 	if err != nil {
 		return nil, err
 	}
@@ -471,14 +508,28 @@ func (c *Connections) ExecuteQuery(activePoolID uuid.UUID, query string, tabID i
 		// Use Exec for write operations
 		tag, err := pool.Exec(ctx, query)
 		if err != nil {
-			return &model.QueryResult{OK: false, Message: err.Error()}
+			return &model.QueryResult{
+				OK:           true,
+				Message:      err.Error(),
+				RowsAffected: int64(0),
+				Columns:      []string{"Error"},
+				Rows:         [][]model.Cell{{model.Cell{Column: "Error", Value: err.Error()}}},
+			}
 		}
 		response.RowsAffected = tag.RowsAffected()
+		response.Columns = []string{"Rows Affected"}
+		response.Rows = [][]model.Cell{{model.Cell{Column: "Rows Affected", Value: fmt.Sprintf("%d", response.RowsAffected)}}}
 	} else {
 		// Use Query for read operations
 		resultRows, err := pool.Query(ctx, query)
 		if err != nil {
-			return &model.QueryResult{OK: false, Message: err.Error()}
+			return &model.QueryResult{
+				OK:           true,
+				Message:      err.Error(),
+				RowsAffected: int64(0),
+				Columns:      []string{"Error"},
+				Rows:         [][]model.Cell{{model.Cell{Column: "Error", Value: err.Error()}}},
+			}
 		}
 		defer resultRows.Close()
 
@@ -507,8 +558,15 @@ func (c *Connections) ExecuteQuery(activePoolID uuid.UUID, query string, tabID i
 					newCell.Value = string(v)
 				case time.Time:
 					newCell.Value = v.Format(time.RFC3339)
-				case uuid.UUID:
-					newCell.Value = v.String()
+				case nil:
+					newCell.Value = "NULL"
+				case [16]uint8:
+					newCell.Value = uuid.UUID(v).String()
+				case string:
+					if v == "" {
+						newCell.Value = "EMPTY"
+					}
+					newCell.Value = v
 				default:
 					newCell.Value = fmt.Sprintf("%v", v)
 				}
@@ -523,6 +581,121 @@ func (c *Connections) ExecuteQuery(activePoolID uuid.UUID, query string, tabID i
 
 		response.Rows = rows
 	}
+
+	output := &model.Output{
+		Columns: response.Columns,
+		Rows:    response.Rows,
+	}
+
+	go c.UpdateTabOutput(tabID, output)
+
+	return response
+}
+
+func (c *Connections) GetTableData(activePoolID uuid.UUID, tabID int64, tableName, selectQuery, limit, offset, where, orderBy, groupBy string) *model.QueryResult {
+	pool, exists := c.PM.GetPool(activePoolID)
+	if !exists {
+		return &model.QueryResult{OK: false, Message: "pool doesn't exist"}
+	}
+
+	ctx := context.Background()
+
+	response := &model.QueryResult{OK: true}
+
+	setLimit := strconv.Itoa(100)
+	if strings.TrimSpace(limit) != "" {
+		limitInt, err := strconv.Atoi(strings.TrimSpace(limit))
+		if err != nil {
+			return &model.QueryResult{OK: false, Message: "limit is not a number"}
+		}
+		if limitInt > 100 {
+			return &model.QueryResult{OK: false, Message: "limit cannot be greater than 100"}
+		}
+		setLimit = strings.TrimSpace(limit)
+	}
+
+	if strings.TrimSpace(selectQuery) == "" {
+		selectQuery = "*"
+	}
+
+	query := fmt.Sprintf("SELECT %s FROM %s", selectQuery, tableName)
+	if strings.TrimSpace(where) != "" {
+		query += fmt.Sprintf(" WHERE %s", strings.TrimSpace(where))
+	}
+	if strings.TrimSpace(groupBy) != "" {
+		query += fmt.Sprintf(" GROUP BY %s", strings.TrimSpace(groupBy))
+	}
+	if strings.TrimSpace(orderBy) != "" {
+		query += fmt.Sprintf(" ORDER BY %s", strings.TrimSpace(orderBy))
+	}
+
+	// Set limit
+	query += fmt.Sprintf(" LIMIT %s", setLimit)
+
+	if strings.TrimSpace(offset) != "" {
+		query += fmt.Sprintf(" OFFSET %s", strings.TrimSpace(offset))
+	}
+
+	// Use Query for read operations
+	resultRows, err := pool.Query(ctx, query)
+	if err != nil {
+		return &model.QueryResult{
+			OK:           true,
+			Message:      err.Error(),
+			RowsAffected: int64(0),
+			Columns:      []string{"Error"},
+			Rows:         [][]model.Cell{{model.Cell{Column: "Error", Value: err.Error()}}},
+		}
+	}
+	defer resultRows.Close()
+
+	columns := resultRows.FieldDescriptions()
+	columnNames := make([]string, len(columns))
+	for i, column := range columns {
+		columnNames[i] = string(column.Name)
+	}
+	response.Columns = columnNames
+
+	var rows [][]model.Cell
+
+	for resultRows.Next() {
+		row, err := resultRows.Values()
+		if err != nil {
+			return &model.QueryResult{OK: false, Message: err.Error()}
+		}
+
+		cells := []model.Cell{}
+		for i, cell := range row {
+			newCell := model.Cell{
+				Column: columnNames[i],
+			}
+			switch v := cell.(type) {
+			case []byte:
+				newCell.Value = string(v)
+			case time.Time:
+				newCell.Value = v.Format(time.RFC3339)
+			case nil:
+				newCell.Value = "NULL"
+			case [16]uint8:
+				newCell.Value = uuid.UUID(v).String()
+			case string:
+				if v == "" {
+					newCell.Value = "EMPTY"
+				}
+				newCell.Value = v
+			default:
+				newCell.Value = fmt.Sprintf("%v", v)
+			}
+			cells = append(cells, newCell)
+		}
+		rows = append(rows, cells)
+	}
+
+	if err := resultRows.Err(); err != nil {
+		return &model.QueryResult{OK: false, Message: err.Error()}
+	}
+
+	response.Rows = rows
 
 	output := &model.Output{
 		Columns: response.Columns,
